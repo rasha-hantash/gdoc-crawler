@@ -42,12 +42,15 @@ type Patcher struct {
 	docsService *docs.Service
 	config      PatcherConfig
 
+	// Step configuration
+	outDir string
+
 	// Pre-compiled regex for finding Google Docs/Sheets links
 	linkRe *regexp.Regexp
 }
 
 // NewPatcher creates a new patcher with the given configuration
-func NewPatcher(ctx context.Context, config PatcherConfig) (*Patcher, error) {
+func NewPatcher(ctx context.Context, config PatcherConfig, outDir string) (*Patcher, error) {
 	opts := []option.ClientOption{}
 	if config.ProjectID != "" {
 		opts = append(opts, option.WithQuotaProject(config.ProjectID))
@@ -61,6 +64,7 @@ func NewPatcher(ctx context.Context, config PatcherConfig) (*Patcher, error) {
 	return &Patcher{
 		docsService: dsvc,
 		config:      config,
+		outDir:      outDir,
 		linkRe:      regexp.MustCompile(`https://docs\.google\.com/(document|spreadsheets)/d/([^/?#]+)`),
 	}, nil
 }
@@ -73,11 +77,14 @@ type PatchStats struct {
 	Failures      int
 }
 
-// Run starts the patching process
-func (p *Patcher) Run(ctx context.Context, outDir string, wait <-chan struct{}) error {
-	<-wait // block until uploader signals completion
+// Name implements the Step interface
+func (p *Patcher) Name() string {
+	return "patcher"
+}
 
-	idMap, err := p.loadIDMap(outDir)
+// Run implements the Step interface and starts the patching process
+func (p *Patcher) Run(ctx context.Context) error {
+	idMap, err := p.loadIDMap(p.outDir)
 	if err != nil {
 		p.logf("no id_map.json found, skipping patching: %v", err)
 		return nil
@@ -86,7 +93,7 @@ func (p *Patcher) Run(ctx context.Context, outDir string, wait <-chan struct{}) 
 	p.logf("patcher loaded %d ID mappings", len(idMap))
 
 	stats := &PatchStats{}
-	err = p.processAllDocs(ctx, outDir, idMap, stats)
+	err = p.processAllDocs(ctx, idMap, stats)
 	if err != nil {
 		return fmt.Errorf("processing documents: %w", err)
 	}
@@ -115,8 +122,8 @@ func (p *Patcher) loadIDMap(outDir string) (map[string]string, error) {
 }
 
 // processAllDocs walks through all directories and patches documents
-func (p *Patcher) processAllDocs(ctx context.Context, outDir string, idMap map[string]string, stats *PatchStats) error {
-	return filepath.WalkDir(outDir, func(path string, d os.DirEntry, walkErr error) error {
+func (p *Patcher) processAllDocs(ctx context.Context, idMap map[string]string, stats *PatchStats) error {
+	return filepath.WalkDir(p.outDir, func(path string, d os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
@@ -273,6 +280,7 @@ func (p *Patcher) buildPatchRequests(doc *docs.Document, urlMap map[string]strin
 				continue
 			}
 
+			// TODO: this needs to remove the /edit from the URL 
 			oldURL := canonicalLink(textRun.TextStyle.Link.Url)
 			newURL, exists := urlMap[oldURL]
 			if !exists {
@@ -338,150 +346,33 @@ func (p *Patcher) logf(format string, v ...any) {
 	}
 }
 
-// RunPatcher provides backward compatibility with the old API
-func RunPatcher(outDir string, projectID string, wait <-chan struct{}) {
-	ctx := context.Background()
+// pre-compiled once; matches “doc … /d/<ID>” or “spreadsheets … /d/<ID>”
+var tidyRE = regexp.MustCompile(`^(https://docs\.google\.com/(?:document|spreadsheets)/d/[^/]+)`)
 
-	config := PatcherConfig{
-		ProjectID:        projectID,
-		Verbose:          true,
-		RateLimitDelay:   1100 * time.Millisecond,
-		MaxRetryAttempts: 6,
-	}
-
-	patcher, err := NewPatcher(ctx, config)
-	if err != nil {
-		logf("FATAL: failed to create patcher: %v", err)
-		return
-	}
-
-	if err := patcher.Run(ctx, outDir, wait); err != nil {
-		logf("FATAL: patcher failed: %v", err)
-		return
-	}
-
-	log.Println("patcher done")
-}
-
-// Helper functions that are still needed globally
-func must(err error) {
-	if err != nil {
-		log.Fatal(err)
-	}
-}
-
-func mustOpen(p string) *os.File {
-	f, err := os.Open(p)
-	must(err)
-	return f
-}
-
-func mustJSON(v any) []byte {
-	b, err := json.MarshalIndent(v, "", "  ")
-	must(err)
-	return b
-}
-
+// canonicalLink unwraps Google’s redirector and drops tracking params.
 func canonicalLink(raw string) string {
-	u := raw
-	for i := 0; i < 3 && redirectRe.MatchString(u); i++ {
-		parsed, _ := url.Parse(u)
-		q := parsed.Query().Get("q")
-		if q == "" {
-			break
-		}
-		u, _ = url.QueryUnescape(q)
-	}
-	return u
-}
+    u := raw
 
-// Legacy retry function for backward compatibility
-func retry[T any](fn func() (T, error)) (T, error) {
-	const maxAttempts = 6
-	const base = time.Second
-	var zero T
-	for i := 0; i < maxAttempts; i++ {
-		v, err := fn()
-		if err == nil {
-			return v, nil
-		}
-		if g, ok := err.(*googleapi.Error); !ok || g.Code != 503 {
-			return zero, err
-		}
-		d := base * time.Duration(math.Pow(2, float64(i)))
-		d += time.Duration(rand.Int63n(int64(d / 2)))
-		time.Sleep(d)
-	}
-	return zero, fmt.Errorf("after %d attempts, still failing with 503", maxAttempts)
-}
+    // ── 1. unwrap Google redirector ──────────────────────────────────────────
+    for i := 0; i < 3 && strings.Contains(u, "://www.google.com/url?"); i++ {
+        parsed, _ := url.Parse(u)
+        real := parsed.Query().Get("q")
+        if real == "" {
+            break
+        }
+        real, _ = url.QueryUnescape(real)
+        u = real
+    }
 
-// Legacy helper functions
-func stripQuery(u string) string {
-	if i := strings.IndexAny(u, "?#"); i != -1 {
-		return u[:i]
-	}
-	return u
-}
+    // ── 2. strip ?query and #fragment ────────────────────────────────────────
+    if i := strings.IndexAny(u, "?#"); i != -1 {
+        u = u[:i]
+    }
 
-func buildURLMap(htmlPath string, re *regexp.Regexp, idMap map[string]string) map[string]string {
-	data, _ := os.ReadFile(htmlPath)
-	matches := re.FindAllSubmatch(data, -1)
-	urlMap := map[string]string{}
-	for _, m := range matches {
-		kind := string(m[1]) // document | spreadsheets
-		oldID := string(m[2])
-		oldKey := map[string]string{"document": "doc:" + oldID, "spreadsheets": "sheet:" + oldID}[kind]
-		newID, ok := idMap[oldKey]
-		if !ok {
-			continue
-		}
-		oldURL := stripQuery(string(m[0]))
-		newURL := fmt.Sprintf("https://docs.google.com/%s/d/%s/edit", kind, newID)
-		urlMap[oldURL] = newURL
-	}
-	return urlMap
-}
+    // ── 3. drop trailing /edit, /view, /preview … ───────────────────────────
+    if m := tidyRE.FindStringSubmatch(u); len(m) > 0 {
+        u = m[1] // keep only the part through “…/d/<ID>”
+    }
 
-func patchOneDoc(ctx context.Context, dsvc *docs.Service, docID string, urlMap map[string]string) {
-	doc, err := dsvc.Documents.Get(docID).Do()
-	if err != nil {
-		logf("patch fetch: %v", err)
-		return
-	}
-
-	var reqs []*docs.Request
-	for _, se := range doc.Body.Content {
-		p := se.Paragraph
-		if p == nil {
-			continue
-		}
-		for _, pe := range p.Elements {
-			tr := pe.TextRun
-			if tr == nil || tr.TextStyle == nil || tr.TextStyle.Link == nil {
-				continue
-			}
-			oldURL := canonicalLink(tr.TextStyle.Link.Url)
-			newURL, ok := urlMap[oldURL]
-			if !ok {
-				continue
-			}
-			reqs = append(reqs, &docs.Request{
-				UpdateTextStyle: &docs.UpdateTextStyleRequest{
-					Range:     &docs.Range{StartIndex: pe.StartIndex, EndIndex: pe.EndIndex},
-					TextStyle: &docs.TextStyle{Link: &docs.Link{Url: newURL}},
-					Fields:    "link",
-				},
-			})
-		}
-	}
-	if len(reqs) == 0 {
-		return
-	}
-
-	_, err = retry(func() (*docs.BatchUpdateDocumentResponse, error) {
-		return dsvc.Documents.BatchUpdate(docID, &docs.BatchUpdateDocumentRequest{Requests: reqs}).Do()
-	})
-	if err != nil {
-		logf("patch update: %v", err)
-	}
+    return u
 }
