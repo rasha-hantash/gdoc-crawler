@@ -57,7 +57,7 @@ export GOOGLE_APPLICATION_CREDENTIALS="path/to/service-account-key.json"
 ### Basic Usage
 
 ```bash
-go run main.go -url "https://docs.google.com/document/d/XXXXXXXX/edit"
+go run main.go -url "https://docs.google.com/document/d/18FiJbYn53fTtPmphfdCKT2TMWH-8Y2L-MLqDk-MFV4s/edit" -project "my-gcp-project"
 ```
 
 ### Full Command with Options

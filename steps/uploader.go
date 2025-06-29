@@ -36,12 +36,15 @@ type Uploader struct {
 	driveService *drive.Service
 	config       UploaderConfig
 
+	// Step configuration
+	outDir string
+
 	// MIME type mappings for different file types
 	mimeTypes map[string]string
 }
 
 // NewUploader creates a new uploader with the given configuration
-func NewUploader(ctx context.Context, config UploaderConfig) (*Uploader, error) {
+func NewUploader(ctx context.Context, config UploaderConfig, outDir string) (*Uploader, error) {
 	opts := []option.ClientOption{}
 	if config.ProjectID != "" {
 		opts = append(opts, option.WithQuotaProject(config.ProjectID))
@@ -55,6 +58,7 @@ func NewUploader(ctx context.Context, config UploaderConfig) (*Uploader, error) 
 	return &Uploader{
 		driveService: drv,
 		config:       config,
+		outDir:       outDir,
 		mimeTypes: map[string]string{
 			"doc":   "application/vnd.google-apps.document",
 			"sheet": "application/vnd.google-apps.spreadsheet",
@@ -69,26 +73,47 @@ type UploadStats struct {
 	Skipped       int
 }
 
-// Run starts the upload process
-func (u *Uploader) Run(ctx context.Context, outDir string, in <-chan string, done chan<- struct{}) error {
-	defer close(done)
+// Name implements the Step interface
+func (u *Uploader) Name() string {
+	return "uploader"
+}
 
+// Run implements the Step interface and starts the upload process
+func (u *Uploader) Run(ctx context.Context) error {
 	parentID, err := u.ensureDriveFolder(ctx)
 	if err != nil {
 		return fmt.Errorf("ensuring Drive folder: %w", err)
 	}
 
+	// Discover directories to process by scanning output directory
+	dirs, err := u.discoverDirectories()
+	if err != nil {
+		return fmt.Errorf("discovering directories: %w", err)
+	}
+
 	idMap := make(map[string]string)
 	stats := &UploadStats{}
 
-	for dir := range in {
-		if err := u.processDirectory(ctx, dir, parentID, idMap, stats); err != nil {
+	for _, dir := range dirs {
+		metadata, err := u.loadMetadata(dir)
+		if err != nil {
+			return fmt.Errorf("loading metadata from %s: %w", dir, err)
+		}
+
+		if metadata.Type == "redirect" {
+			stats.Skipped++
+			continue
+		}
+
+		if err := u.processDirectory(ctx, dir, parentID, idMap, metadata); err != nil {
 			u.logf("WARN processing directory %s: %v", dir, err)
 			stats.Failed++
+			continue
 		}
+		stats.TotalUploaded++
 	}
 
-	if err := u.writeIDMap(outDir, idMap); err != nil {
+	if err := u.writeIDMap(u.outDir, idMap); err != nil {
 		return fmt.Errorf("writing ID map: %w", err)
 	}
 
@@ -97,18 +122,39 @@ func (u *Uploader) Run(ctx context.Context, outDir string, in <-chan string, don
 	return nil
 }
 
-// processDirectory handles uploading a single directory
-func (u *Uploader) processDirectory(ctx context.Context, dir string, parentID string, idMap map[string]string, stats *UploadStats) error {
-	metadata, err := u.loadMetadata(dir)
-	if err != nil {
-		return fmt.Errorf("loading metadata: %w", err)
-	}
+// discoverDirectories recursively scans the output directory for subdirectories with metadata
+func (u *Uploader) discoverDirectories() ([]string, error) {
+	var dirs []string
 
-	if metadata.Type == "redirect" {
-		stats.Skipped++
+	err := filepath.WalkDir(u.outDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+
+		// Skip if not a directory
+		if !d.IsDir() {
+			return nil
+		}
+
+		// Check if this directory contains metadata.json
+		metadataPath := filepath.Join(path, "metadata.json")
+		if _, err := os.Stat(metadataPath); err == nil {
+			dirs = append(dirs, path)
+		}
+
 		return nil
+	})
+
+	if err != nil {
+		return nil, fmt.Errorf("walking output directory: %w", err)
 	}
 
+	u.logf("Discovered %d directories to process", len(dirs))
+	return dirs, nil
+}
+
+// processDirectory handles uploading a single directory
+func (u *Uploader) processDirectory(ctx context.Context, dir string, parentID string, idMap map[string]string, metadata *types.Metadata) error {
 	contentFile := u.getContentFileName(metadata.Type)
 	if contentFile == "" {
 		return fmt.Errorf("unsupported content type: %s", metadata.Type)
@@ -120,13 +166,8 @@ func (u *Uploader) processDirectory(ctx context.Context, dir string, parentID st
 		return fmt.Errorf("uploading file: %w", err)
 	}
 
-	if newID != "" {
-		key := fmt.Sprintf("%s:%s", metadata.Type, metadata.ID)
-		idMap[key] = newID
-		stats.TotalUploaded++
-	} else {
-		stats.Failed++
-	}
+	key := fmt.Sprintf("%s:%s", metadata.Type, metadata.ID)
+	idMap[key] = newID
 
 	return nil
 }
@@ -259,27 +300,5 @@ func (u *Uploader) writeIDMap(outDir string, idMap map[string]string) error {
 func (u *Uploader) logf(format string, v ...any) {
 	if u.config.Verbose {
 		log.Printf(format, v...)
-	}
-}
-
-// RunUploader provides backward compatibility with the old API
-func RunUploader(projectID string, driveFolder string, outDir string, in <-chan string, done chan<- struct{}) {
-	ctx := context.Background()
-
-	config := UploaderConfig{
-		ProjectID:   projectID,
-		DriveFolder: driveFolder,
-		Verbose:     true,
-	}
-
-	uploader, err := NewUploader(ctx, config)
-	if err != nil {
-		logf("FATAL: failed to create uploader: %v", err)
-		close(done)
-		return
-	}
-
-	if err := uploader.Run(ctx, outDir, in, done); err != nil {
-		logf("FATAL: uploader failed: %v", err)
 	}
 }
