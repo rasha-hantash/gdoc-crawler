@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"mime"
 	"os"
 	"path/filepath"
@@ -20,14 +20,12 @@ import (
 type UploaderConfig struct {
 	ProjectID   string
 	DriveFolder string
-	Verbose     bool
 }
 
 // DefaultUploaderConfig returns a default uploader configuration
 func DefaultUploaderConfig() UploaderConfig {
 	return UploaderConfig{
 		DriveFolder: "Imported Docs",
-		Verbose:     true,
 	}
 }
 
@@ -94,6 +92,10 @@ func (u *Uploader) Run(ctx context.Context) error {
 	idMap := make(map[string]string)
 	stats := &UploadStats{}
 
+	slog.Info("starting upload",
+		slog.String("output_dir", u.outDir),
+		slog.Int("directories_found", len(dirs)))
+
 	for _, dir := range dirs {
 		metadata, err := u.loadMetadata(dir)
 		if err != nil {
@@ -106,7 +108,9 @@ func (u *Uploader) Run(ctx context.Context) error {
 		}
 
 		if err := u.processDirectory(ctx, dir, parentID, idMap, metadata); err != nil {
-			u.logf("WARN processing directory %s: %v", dir, err)
+			slog.Warn("processing directory failed",
+				slog.String("dir", dir),
+				slog.Any("error", err))
 			stats.Failed++
 			continue
 		}
@@ -117,8 +121,10 @@ func (u *Uploader) Run(ctx context.Context) error {
 		return fmt.Errorf("writing ID map: %w", err)
 	}
 
-	u.logf("Upload completed: %d uploaded, %d failed, %d skipped",
-		stats.TotalUploaded, stats.Failed, stats.Skipped)
+	slog.Info("upload completed",
+		slog.Int("uploaded", stats.TotalUploaded),
+		slog.Int("failed", stats.Failed),
+		slog.Int("skipped", stats.Skipped))
 	return nil
 }
 
@@ -149,7 +155,7 @@ func (u *Uploader) discoverDirectories() ([]string, error) {
 		return nil, fmt.Errorf("walking output directory: %w", err)
 	}
 
-	u.logf("Discovered %d directories to process", len(dirs))
+	slog.Info("discovered directories", slog.Int("count", len(dirs)))
 	return dirs, nil
 }
 
@@ -214,7 +220,9 @@ func (u *Uploader) ensureDriveFolder(ctx context.Context) (string, error) {
 	}
 
 	if len(r.Files) > 0 {
-		u.logf("Found existing folder: %s (ID: %s)", u.config.DriveFolder, r.Files[0].Id)
+		slog.Info("found existing drive folder",
+			slog.String("name", u.config.DriveFolder),
+			slog.String("id", r.Files[0].Id))
 		return r.Files[0].Id, nil
 	}
 
@@ -229,7 +237,9 @@ func (u *Uploader) ensureDriveFolder(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("creating folder: %w", err)
 	}
 
-	u.logf("Created Drive folder: %s (ID: %s)", u.config.DriveFolder, created.Id)
+	slog.Info("created drive folder",
+		slog.String("name", u.config.DriveFolder),
+		slog.String("id", created.Id))
 	return created.Id, nil
 }
 
@@ -271,14 +281,17 @@ func (u *Uploader) uploadFile(ctx context.Context, filePath string, metadata *ty
 		return "", fmt.Errorf("Drive API upload: %w", err)
 	}
 
-	u.logf("uploaded %-6s → %s (title: %s)", metadata.Type, resp.Id, metadata.Title)
+	slog.Info("uploaded file",
+		slog.String("type", metadata.Type),
+		slog.String("id", resp.Id),
+		slog.String("title", metadata.Title))
 	return resp.Id, nil
 }
 
 // writeIDMap writes the ID mapping to a JSON file
 func (u *Uploader) writeIDMap(outDir string, idMap map[string]string) error {
 	if len(idMap) == 0 {
-		u.logf("No files uploaded, skipping ID map creation")
+		slog.Info("no files uploaded, skipping ID map creation")
 		return nil
 	}
 
@@ -292,13 +305,8 @@ func (u *Uploader) writeIDMap(outDir string, idMap map[string]string) error {
 		return fmt.Errorf("writing ID map file: %w", err)
 	}
 
-	u.logf("uploader wrote ID map → %s (%d mappings)", mapPath, len(idMap))
+	slog.Info("wrote ID map",
+		slog.String("path", mapPath),
+		slog.Int("mappings", len(idMap)))
 	return nil
-}
-
-// logf logs a message if verbose logging is enabled
-func (u *Uploader) logf(format string, v ...any) {
-	if u.config.Verbose {
-		log.Printf(format, v...)
-	}
 }
