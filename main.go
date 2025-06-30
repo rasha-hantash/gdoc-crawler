@@ -250,10 +250,11 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"time"
 
+	"github.com/rasha-hantash/gdoc-pipeline/lib/logger"
 	"github.com/rasha-hantash/gdoc-pipeline/steps"
 )
 
@@ -269,7 +270,6 @@ func main() {
 		retry       string
 		projectID   string
 		driveFolder string
-		verbose     bool
 		// timeout     time.Duration
 	)
 
@@ -280,38 +280,44 @@ func main() {
 	// flag.DurationVar(&timeout, "timeout", 60*time.Minute, "overall pipeline timeout (0 = none)")
 	flag.StringVar(&projectID, "project", "", "GCP quota-project (optional)")
 	flag.StringVar(&driveFolder, "folder", "Imported Docs", "Drive folder (created if absent)")
-	flag.BoolVar(&verbose, "v", false, "Verbose logging")
-	flag.BoolVar(&verbose, "verbose", false, "Verbose logging (alias of -v)")
 	flag.Parse()
 
 	if url == "" {
-		log.Fatal("‑url flag is required")
+		slog.Error("url flag is required")
+		os.Exit(1)
 	}
 
 	ctx := context.Background()
+	// load configuration
+	slogHandler := &logger.ContextHandler{Handler: slog.NewJSONHandler(os.Stdout, nil)}
+	slog.SetDefault(slog.New(slogHandler))
+
+	slog.Info("starting pipeline",
+		slog.String("url", url),
+		slog.String("output_dir", out),
+		slog.Int("max_depth", depth))
 
 	// instantiate the crawler, uploader, and patcher
 	crawler := steps.NewCrawler(steps.Config{
 		HTTPTimeout: 15 * time.Second,
 		MaxDepth:    depth,
-		Verbose:     verbose,
 	}, url, out)
 	uploader, err := steps.NewUploader(ctx, steps.UploaderConfig{
 		ProjectID:   projectID,
 		DriveFolder: driveFolder,
-		Verbose:     verbose,
 	}, out)
 	if err != nil {
-		log.Fatalf("Failed to create uploader: %v", err)
+		slog.Error("failed to create uploader", slog.Any("error", err))
+		os.Exit(1)
 	}
 	patcher, err := steps.NewPatcher(ctx, steps.PatcherConfig{
 		ProjectID:        projectID,
-		Verbose:          verbose,
 		RateLimitDelay:   1100 * time.Millisecond, // Stay under 60 req/min
 		MaxRetryAttempts: 6,
 	}, out)
 	if err != nil {
-		log.Fatalf("Failed to create patcher: %v", err)
+		slog.Error("failed to create patcher", slog.Any("error", err))
+		os.Exit(1)
 	}
 
 	steps := []Step{
@@ -326,21 +332,25 @@ func main() {
 	if retry != "" {
 		idx = pipe.FindIndex(retry)
 		if idx == -1 {
-			log.Fatalf("unknown step %q — valid values: crawler, uploader, patcher", retry)
+			slog.Error("unknown step",
+				slog.String("step", retry),
+				slog.String("valid_values", "crawler, uploader, patcher"))
+			os.Exit(1)
 		}
 	}
 
 	if err := pipe.RunFrom(ctx, idx); err != nil {
 		var pathErr *os.PathError
 		if errors.As(err, &pathErr) {
-			log.Fatalf("filesystem error: %v", pathErr)
+			slog.Error("filesystem error", slog.Any("error", pathErr))
+			os.Exit(1)
 		}
-		log.Fatalf("pipeline failed: %v", err)
+		slog.Error("pipeline failed", slog.Any("error", err))
+		os.Exit(1)
 	}
 
-	log.Print("[pipeline] ✅ all steps completed successfully")
+	slog.Info("pipeline completed successfully")
 }
-
 
 // Step represents a discrete unit of work in the pipeline.
 // Every step must be idempotent so it can safely be re‑executed.
@@ -367,14 +377,19 @@ func (p *Pipeline) RunFrom(ctx context.Context, start int) error {
 
 	for i := start; i < len(p.steps); i++ {
 		step := p.steps[i]
-		log.Printf("[pipeline] ▶ running step %s (%d/%d)", step.Name(), i+1, len(p.steps))
+		slog.Info("running step",
+			slog.String("step", step.Name()),
+			slog.Int("current", i+1),
+			slog.Int("total", len(p.steps)))
 		t0 := time.Now()
 
 		if err := step.Run(ctx); err != nil {
 			return fmt.Errorf("step %s failed after %s: %w", step.Name(), time.Since(t0).Truncate(time.Millisecond), err)
 		}
 
-		log.Printf("[pipeline] ✓ completed %s in %s", step.Name(), time.Since(t0).Truncate(time.Millisecond))
+		slog.Info("completed step",
+			slog.String("step", step.Name()),
+			slog.Duration("duration", time.Since(t0).Truncate(time.Millisecond)))
 	}
 
 	return nil

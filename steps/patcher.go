@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"math"
 	"math/rand"
 	"net/url"
@@ -23,7 +23,6 @@ import (
 // PatcherConfig holds the patcher configuration
 type PatcherConfig struct {
 	ProjectID        string
-	Verbose          bool
 	RateLimitDelay   time.Duration // Delay between API calls to stay under rate limits
 	MaxRetryAttempts int           // Maximum retry attempts for failed requests
 }
@@ -31,7 +30,6 @@ type PatcherConfig struct {
 // DefaultPatcherConfig returns a default patcher configuration
 func DefaultPatcherConfig() PatcherConfig {
 	return PatcherConfig{
-		Verbose:          true,
 		RateLimitDelay:   1100 * time.Millisecond, // Stay ≤ 60 req/min
 		MaxRetryAttempts: 6,
 	}
@@ -86,11 +84,11 @@ func (p *Patcher) Name() string {
 func (p *Patcher) Run(ctx context.Context) error {
 	idMap, err := p.loadIDMap(p.outDir)
 	if err != nil {
-		p.logf("no id_map.json found, skipping patching: %v", err)
+		slog.Info("no id_map.json found, skipping patching", slog.Any("error", err))
 		return nil
 	}
 
-	p.logf("patcher loaded %d ID mappings", len(idMap))
+	slog.Info("patcher started", slog.Int("id_mappings", len(idMap)))
 
 	stats := &PatchStats{}
 	err = p.processAllDocs(ctx, idMap, stats)
@@ -98,8 +96,11 @@ func (p *Patcher) Run(ctx context.Context) error {
 		return fmt.Errorf("processing documents: %w", err)
 	}
 
-	p.logf("Patching completed: %d docs processed, %d links patched, %d skipped, %d failures",
-		stats.DocsProcessed, stats.LinksPatched, stats.DocsSkipped, stats.Failures)
+	slog.Info("patching completed",
+		slog.Int("docs_processed", stats.DocsProcessed),
+		slog.Int("links_patched", stats.LinksPatched),
+		slog.Int("docs_skipped", stats.DocsSkipped),
+		slog.Int("failures", stats.Failures))
 
 	return nil
 }
@@ -133,7 +134,9 @@ func (p *Patcher) processAllDocs(ctx context.Context, idMap map[string]string, s
 		}
 
 		if err := p.processDocument(ctx, path, idMap, stats); err != nil {
-			p.logf("WARN processing document %s: %v", path, err)
+			slog.Warn("processing document failed",
+				slog.String("path", path),
+				slog.Any("error", err))
 			stats.Failures++
 		}
 
@@ -180,7 +183,9 @@ func (p *Patcher) processDocument(ctx context.Context, metaPath string, idMap ma
 	stats.DocsProcessed++
 	stats.LinksPatched += linksPatched
 
-	p.logf("patched %-40s (%d links)", metadata.Title, linksPatched)
+	slog.Info("patched document",
+		slog.String("title", metadata.Title),
+		slog.Int("links_patched", linksPatched))
 
 	// Rate limiting to stay under API limits
 	time.Sleep(p.config.RateLimitDelay)
@@ -280,7 +285,7 @@ func (p *Patcher) buildPatchRequests(doc *docs.Document, urlMap map[string]strin
 				continue
 			}
 
-			// TODO: this needs to remove the /edit from the URL 
+			// TODO: this needs to remove the /edit from the URL
 			oldURL := canonicalLink(textRun.TextStyle.Link.Url)
 			newURL, exists := urlMap[oldURL]
 			if !exists {
@@ -325,7 +330,9 @@ func (p *Patcher) executeWithRetry(ctx context.Context, fn func() error) error {
 		jitter := time.Duration(rand.Int63n(int64(delay / 2)))
 		time.Sleep(delay + jitter)
 
-		p.logf("Retrying after 503 error (attempt %d/%d)", i+1, p.config.MaxRetryAttempts)
+		slog.Info("retrying after 503 error",
+			slog.Int("attempt", i+1),
+			slog.Int("max_attempts", p.config.MaxRetryAttempts))
 	}
 
 	return fmt.Errorf("failed after %d attempts with 503 errors", p.config.MaxRetryAttempts)
@@ -339,40 +346,33 @@ func (p *Patcher) stripQuery(url string) string {
 	return url
 }
 
-// logf logs a message if verbose logging is enabled
-func (p *Patcher) logf(format string, v ...any) {
-	if p.config.Verbose {
-		log.Printf(format, v...)
-	}
-}
-
-// pre-compiled once; matches “doc … /d/<ID>” or “spreadsheets … /d/<ID>”
+// pre-compiled once; matches "doc … /d/<ID>" or "spreadsheets … /d/<ID>"
 var tidyRE = regexp.MustCompile(`^(https://docs\.google\.com/(?:document|spreadsheets)/d/[^/]+)`)
 
-// canonicalLink unwraps Google’s redirector and drops tracking params.
+// canonicalLink unwraps Google's redirector and drops tracking params.
 func canonicalLink(raw string) string {
-    u := raw
+	u := raw
 
-    // ── 1. unwrap Google redirector ──────────────────────────────────────────
-    for i := 0; i < 3 && strings.Contains(u, "://www.google.com/url?"); i++ {
-        parsed, _ := url.Parse(u)
-        real := parsed.Query().Get("q")
-        if real == "" {
-            break
-        }
-        real, _ = url.QueryUnescape(real)
-        u = real
-    }
+	// ── 1. unwrap Google redirector ──────────────────────────────────────────
+	for i := 0; i < 3 && strings.Contains(u, "://www.google.com/url?"); i++ {
+		parsed, _ := url.Parse(u)
+		real := parsed.Query().Get("q")
+		if real == "" {
+			break
+		}
+		real, _ = url.QueryUnescape(real)
+		u = real
+	}
 
-    // ── 2. strip ?query and #fragment ────────────────────────────────────────
-    if i := strings.IndexAny(u, "?#"); i != -1 {
-        u = u[:i]
-    }
+	// ── 2. strip ?query and #fragment ────────────────────────────────────────
+	if i := strings.IndexAny(u, "?#"); i != -1 {
+		u = u[:i]
+	}
 
-    // ── 3. drop trailing /edit, /view, /preview … ───────────────────────────
-    if m := tidyRE.FindStringSubmatch(u); len(m) > 0 {
-        u = m[1] // keep only the part through “…/d/<ID>”
-    }
+	// ── 3. drop trailing /edit, /view, /preview … ───────────────────────────
+	if m := tidyRE.FindStringSubmatch(u); len(m) > 0 {
+		u = m[1] // keep only the part through "…/d/<ID>"
+	}
 
-    return u
+	return u
 }

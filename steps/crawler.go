@@ -7,7 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -25,11 +25,6 @@ var (
 	redirectRe   = regexp.MustCompile(`^https?://(www\.)?google\.com/url`)
 	googleDocsRe = regexp.MustCompile(`docs\.google\.com/(document|spreadsheets)/d/([^/?#]+)`)
 )
-
-// Global logf function for package-wide logging (used by patcher.go and uploader.go)
-func logf(format string, v ...any) {
-	log.Printf(format, v...)
-}
 
 // canonicalizeURL performs all canonicalization in one pass:
 // 1. Unwraps Google redirects
@@ -89,7 +84,6 @@ func extractID(canonicalKey string) string {
 type Config struct {
 	HTTPTimeout time.Duration
 	MaxDepth    int
-	Verbose     bool
 }
 
 // DefaultConfig returns a default configuration
@@ -97,7 +91,6 @@ func DefaultConfig() Config {
 	return Config{
 		HTTPTimeout: 10 * time.Second,
 		MaxDepth:    3,
-		Verbose:     true,
 	}
 }
 
@@ -158,6 +151,11 @@ func (c *Crawler) Run(ctx context.Context) error {
 	pendingLinks := []types.Links{{Link: c.startURL, Depth: 0, Parent: c.outDir}}
 	processedURLs := make(map[string]string)
 
+	slog.Info("starting crawl",
+		slog.String("start_url", c.startURL),
+		slog.String("output_dir", c.outDir),
+		slog.Int("max_depth", c.config.MaxDepth))
+
 	for len(pendingLinks) > 0 {
 		currentLink := c.popLink(&pendingLinks)
 
@@ -166,13 +164,17 @@ func (c *Crawler) Run(ctx context.Context) error {
 		}
 
 		if err := c.processUrl(ctx, currentLink, processedURLs, &pendingLinks); err != nil {
-			c.logf("Error processing %s: %v", currentLink.Link, err)
+			slog.Warn("error processing url",
+				slog.String("url", currentLink.Link),
+				slog.Any("error", err))
 			continue
 		}
 	}
 
-	c.logf("Crawl completed in %v", time.Since(start))
-	c.logf("Total documents: %d, Total sheets: %d", stats.TotalDocs, stats.TotalSheets)
+	slog.Info("crawl completed",
+		slog.Duration("duration", time.Since(start)),
+		slog.Int("total_docs", stats.TotalDocs),
+		slog.Int("total_sheets", stats.TotalSheets))
 	return nil
 }
 
@@ -200,7 +202,9 @@ func (c *Crawler) processUrl(ctx context.Context, task types.Links, processedURL
 			Type:       "redirect",
 			RedirectTo: targetRel,
 		})
-		c.logf("↩︎ duplicate %s → redirect metadata", canonical)
+		slog.Info("duplicate url",
+			slog.String("url", canonical),
+			slog.String("redirect_to", targetRel))
 		return nil
 	}
 
@@ -283,7 +287,9 @@ func (c *Crawler) scrapeContent(ctx context.Context, t types.Links, docType stri
 		// TODO Do i need to do it this way? why can't I fetch the title the same way as fetching a Google Doc
 		title, err = c.fetchSheetTitle(ctx, id)
 		if err != nil {
-			c.logf("    failed to get sheet title: %v", err)
+			slog.Warn("failed to get sheet title",
+				slog.String("id", id),
+				slog.Any("error", err))
 			title = "Untitled Sheet"
 		}
 	}
@@ -314,7 +320,10 @@ func (c *Crawler) scrapeContent(ctx context.Context, t types.Links, docType stri
 		Type:      docType,
 	})
 
-	c.logf("    saved %s → %s", strings.Title(docType), dir)
+	slog.Info("saved url",
+		slog.String("url", t.Link),
+		slog.String("type", strings.Title(docType)),
+		slog.String("dir", dir))
 	return links, dir, nil
 }
 
@@ -351,27 +360,27 @@ func (c *Crawler) extractIDFromURL(url string) string {
 	return extractID(canonical)
 }
 
-func (c *Crawler) logf(format string, v ...any) {
-	if c.config.Verbose {
-		log.Printf(format, v...)
-	}
-}
-
 func (c *Crawler) writeMetadata(dir string, m types.Metadata) {
 	m.CrawledAt = time.Now().UTC()
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		c.logf("WARN: failed to create metadata directory: %v", err)
+		slog.Warn("failed to create metadata directory",
+			slog.String("dir", dir),
+			slog.Any("error", err))
 		return
 	}
 
 	b, err := json.MarshalIndent(m, "", "  ")
 	if err != nil {
-		c.logf("WARN: failed to marshal metadata: %v", err)
+		slog.Warn("failed to marshal metadata",
+			slog.String("dir", dir),
+			slog.Any("error", err))
 		return
 	}
 
 	if err := os.WriteFile(filepath.Join(dir, "metadata.json"), b, 0o644); err != nil {
-		c.logf("WARN: failed to write metadata: %v", err)
+		slog.Warn("failed to write metadata",
+			slog.String("dir", dir),
+			slog.Any("error", err))
 	}
 }
 
@@ -495,7 +504,7 @@ func RunCrawler(startURL string, outDir string, out chan<- string) {
 	crawler := NewCrawler(DefaultConfig(), startURL, outDir)
 	ctx := context.Background()
 	if err := crawler.Run(ctx); err != nil {
-		logf("Crawler failed: %v", err)
+		slog.Error("crawler failed", slog.Any("error", err))
 	}
 	close(out)
 }
