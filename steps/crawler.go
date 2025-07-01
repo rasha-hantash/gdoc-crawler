@@ -20,16 +20,179 @@ import (
 	"golang.org/x/net/html"
 )
 
+// CrawlStats holds statistics about the crawling process
+type CrawlStats struct {
+	TotalDocs   int
+	TotalSheets int
+}
+
+// Document type configuration
+type docConfig struct {
+	exportURLTemplate string
+	filename          string
+	canExtractLinks   bool
+}
+
+var docConfigs = map[string]docConfig{
+	"doc": {
+		exportURLTemplate: "https://docs.google.com/document/d/%s/export?format=html",
+		filename:          "content.html",
+		canExtractLinks:   true,
+	},
+	"sheet": {
+		exportURLTemplate: "https://docs.google.com/spreadsheets/d/%s/export?format=csv",
+		filename:          "content.csv",
+		canExtractLinks:   false,
+	},
+}
+
 // Global regex patterns
 var (
 	redirectRe   = regexp.MustCompile(`^https?://(www\.)?google\.com/url`)
 	googleDocsRe = regexp.MustCompile(`docs\.google\.com/(document|spreadsheets)/d/([^/?#]+)`)
+	nonAlphaNum  = regexp.MustCompile(`[^a-z0-9]+`)
+	multiHyphen  = regexp.MustCompile(`-{2,}`)
+	titleTrimRE  = regexp.MustCompile(`\s*-\s*Google (Docs?|Sheets?)\s*$`)
 )
 
-// canonicalizeURL performs all canonicalization in one pass:
-// 1. Unwraps Google redirects
-// 2. Extracts document type and ID
-// 3. Returns canonical key ("doc:ID" or "sheet:ID") and clean URL
+// Crawler handles the crawling process with configurable settings and dependencies
+type Crawler struct {
+	httpClient *http.Client
+	MaxDepth   int
+	startURL   string
+	outDir     string
+}
+
+// NewCrawler creates a new crawler with the given configuration
+func NewCrawler(maxDepth int, httpTimeout time.Duration, startURL, outDir string) *Crawler {
+	return &Crawler{
+		httpClient: &http.Client{Timeout: httpTimeout},
+		MaxDepth:   maxDepth,
+		startURL:   startURL,
+		outDir:     outDir,
+	}
+}
+
+// Name implements the Step interface
+func (c *Crawler) Name() string {
+	return "crawler"
+}
+
+// Run implements the Step interface and starts the crawling process
+func (c *Crawler) Run(ctx context.Context) error {
+	// Clean and create output directory
+	if err := os.RemoveAll(c.outDir); err != nil {
+		return fmt.Errorf("failed to remove output directory: %w", err)
+	}
+	if err := os.MkdirAll(c.outDir, 0o755); err != nil {
+		return fmt.Errorf("failed to create output directory: %w", err)
+	}
+
+	start := time.Now()
+	stats := &CrawlStats{}
+
+	pendingLinks := []types.Links{{Link: c.startURL, Depth: 0, Parent: c.outDir}}
+	processedURLs := make(map[string]string)
+
+	slog.Info("starting crawl",
+		slog.String("start_url", c.startURL),
+		slog.String("output_dir", c.outDir),
+		slog.Int("max_depth", c.MaxDepth))
+
+	for len(pendingLinks) > 0 {
+		currentLink := c.popLink(&pendingLinks)
+
+		if currentLink.Depth > c.MaxDepth {
+			continue
+		}
+
+		if err := c.processUrl(ctx, currentLink, processedURLs, &pendingLinks); err != nil {
+			slog.Warn("error processing url",
+				slog.String("url", currentLink.Link),
+				slog.Any("error", err))
+			continue
+		}
+	}
+
+	slog.Info("crawl completed",
+		slog.Duration("duration", time.Since(start)),
+		slog.Int("total_docs", stats.TotalDocs),
+		slog.Int("total_sheets", stats.TotalSheets))
+	return nil
+}
+
+// popLink removes and returns the first link from the queue (FIFO)
+func (c *Crawler) popLink(pendingLinks *[]types.Links) types.Links {
+	link := (*pendingLinks)[0]
+	*pendingLinks = (*pendingLinks)[1:]
+	return link
+}
+
+func (c *Crawler) processUrl(ctx context.Context, task types.Links, processedURLs map[string]string, pendingLinks *[]types.Links) error {
+	canonical, cleanURL := canonicalizeURL(task.Link)
+	if canonical == "" {
+		return nil // Not a Google Doc/Sheet, skip
+	}
+
+	// Check for URLs that have already been processed and redirect to a different URL
+	if dir, duplicate := processedURLs[canonical]; duplicate {
+		targetRel, _ := filepath.Rel(task.Parent, dir)
+		// Determine underlying document type (doc or sheet) for redirect metadata
+		parts := strings.SplitN(canonical, ":", 2)
+		docType := "doc"
+		if len(parts) > 0 {
+			docType = parts[0]
+		}
+
+		c.writeMetadata(filepath.Join(task.Parent, filepath.Base(dir)+"-redirect"), types.Metadata{
+			Title:      filepath.Base(dir),
+			ID:         extractID(canonical),
+			SourceURL:  task.Link,
+			Depth:      task.Depth,
+			Type:       docType,
+			IsRedirect: true,
+			RedirectTo: targetRel,
+		})
+		slog.Info("duplicate url",
+			slog.String("url", canonical),
+			slog.String("redirect_to", targetRel))
+		return nil
+	}
+
+	// Process based on type
+	if strings.HasPrefix(canonical, "doc:") || strings.HasPrefix(canonical, "sheet:") {
+		docType := strings.SplitN(canonical, ":", 2)[0]
+		links, dir, err := c.scrapeContent(ctx, task, docType, canonical, cleanURL)
+		if err != nil {
+			return err
+		}
+		processedURLs[canonical] = dir
+
+		// Only docs extract links for further crawling
+		if docType == "doc" {
+			*pendingLinks = append(*pendingLinks, links...)
+		}
+		return nil
+	}
+
+	return nil
+}
+
+// canonicalizeURL normalizes any Google Docs/Sheets link so the crawler sees each logical
+// document exactly once. Links to the same file can look wildly different:
+//   - Google's redirector (`https://www.google.com/url?q=...`)
+//   - Trailing path modifiers (`/edit`, `/view`, `/preview` …)
+//   - Tracking query-string parameters (`?usp=sharing`, `&pli=1` …)
+//   - Fragment identifiers (`#heading=h.gjdgxs`)
+//
+// If we compared raw URLs we would store duplicates and re-crawl the same file many times.
+// Instead we collapse every variant to a *canonical key* and a cleaned URL:
+//
+//	key   →  "doc:<ID>" | "sheet:<ID>"
+//	clean →  absolute URL without redirector, params or fragments
+//
+// The key feeds the `processedURLs` map so duplicates become lightweight redirect entries
+// and are skipped on subsequent visits. See crawler_test.go for concrete examples.
 func canonicalizeURL(rawURL string) (canonicalKey, cleanURL string) {
 	// Step 1: Unwrap redirects (max 3 levels)
 	cleanURL = rawURL
@@ -80,216 +243,48 @@ func extractID(canonicalKey string) string {
 	return ""
 }
 
-// Config holds the crawler configuration
-type Config struct {
-	HTTPTimeout time.Duration
-	MaxDepth    int
-}
-
-// DefaultConfig returns a default configuration
-func DefaultConfig() Config {
-	return Config{
-		HTTPTimeout: 10 * time.Second,
-		MaxDepth:    3,
-	}
-}
-
-// Crawler handles the crawling process with configurable settings and dependencies
-type Crawler struct {
-	httpClient *http.Client
-	config     Config
-
-	// Step configuration
-	startURL string
-	outDir   string
-
-	// Compiled regex patterns for text processing
-	nonAlphaNum *regexp.Regexp
-	multiHyphen *regexp.Regexp
-	titleTrimRE *regexp.Regexp
-}
-
-// CrawlStats holds statistics about the crawling process
-type CrawlStats struct {
-	TotalDocs   int
-	TotalSheets int
-}
-
-// NewCrawler creates a new crawler with the given configuration
-func NewCrawler(config Config, startURL, outDir string) *Crawler {
-	return &Crawler{
-		httpClient: &http.Client{Timeout: config.HTTPTimeout},
-		config:     config,
-		startURL:   startURL,
-		outDir:     outDir,
-
-		// Pre-compile regex patterns for better performance
-		nonAlphaNum: regexp.MustCompile(`[^a-z0-9]+`),
-		multiHyphen: regexp.MustCompile(`-{2,}`),
-		titleTrimRE: regexp.MustCompile(`\s*-\s*Google (Docs?|Sheets?)\s*$`),
-	}
-}
-
-// Name implements the Step interface
-func (c *Crawler) Name() string {
-	return "crawler"
-}
-
-// Run implements the Step interface and starts the crawling process
-func (c *Crawler) Run(ctx context.Context) error {
-	// Clean and create output directory
-	if err := os.RemoveAll(c.outDir); err != nil {
-		return fmt.Errorf("failed to remove output directory: %w", err)
-	}
-	if err := os.MkdirAll(c.outDir, 0o755); err != nil {
-		return fmt.Errorf("failed to create output directory: %w", err)
-	}
-
-	start := time.Now()
-	stats := &CrawlStats{}
-
-	pendingLinks := []types.Links{{Link: c.startURL, Depth: 0, Parent: c.outDir}}
-	processedURLs := make(map[string]string)
-
-	slog.Info("starting crawl",
-		slog.String("start_url", c.startURL),
-		slog.String("output_dir", c.outDir),
-		slog.Int("max_depth", c.config.MaxDepth))
-
-	for len(pendingLinks) > 0 {
-		currentLink := c.popLink(&pendingLinks)
-
-		if currentLink.Depth > c.config.MaxDepth {
-			continue
-		}
-
-		if err := c.processUrl(ctx, currentLink, processedURLs, &pendingLinks); err != nil {
-			slog.Warn("error processing url",
-				slog.String("url", currentLink.Link),
-				slog.Any("error", err))
-			continue
-		}
-	}
-
-	slog.Info("crawl completed",
-		slog.Duration("duration", time.Since(start)),
-		slog.Int("total_docs", stats.TotalDocs),
-		slog.Int("total_sheets", stats.TotalSheets))
-	return nil
-}
-
-// popLink removes and returns the first link from the queue (FIFO)
-func (c *Crawler) popLink(queue *[]types.Links) types.Links {
-	link := (*queue)[0]
-	*queue = (*queue)[1:]
-	return link
-}
-
-func (c *Crawler) processUrl(ctx context.Context, task types.Links, processedURLs map[string]string, queue *[]types.Links) error {
-	canonical, _ := canonicalizeURL(task.Link)
-	if canonical == "" {
-		return nil // Not a Google Doc/Sheet, skip
-	}
-
-	// Check for URLs that have already been processed and redirect to a different URL
-	if dir, duplicate := processedURLs[canonical]; duplicate {
-		targetRel, _ := filepath.Rel(task.Parent, dir)
-		c.writeMetadata(filepath.Join(task.Parent, filepath.Base(dir)+"-redirect"), types.Metadata{
-			Title:      filepath.Base(dir),
-			ID:         extractID(canonical),
-			SourceURL:  task.Link,
-			Depth:      task.Depth,
-			Type:       "redirect",
-			RedirectTo: targetRel,
-		})
-		slog.Info("duplicate url",
-			slog.String("url", canonical),
-			slog.String("redirect_to", targetRel))
-		return nil
-	}
-
-	// Process based on type
-	switch {
-	case strings.HasPrefix(canonical, "doc:"):
-		// Process document
-		links, dir, err := c.scrapeContent(ctx, task, "doc")
-		if err != nil {
-			return err
-		}
-		processedURLs[canonical] = dir
-		*queue = append(*queue, links...)
-		return nil
-	case strings.HasPrefix(canonical, "sheet:"):
-		// Process sheet
-		_, dir, err := c.scrapeContent(ctx, task, "sheet")
-		if err != nil {
-			return err
-		}
-		processedURLs[canonical] = dir
-		return nil
-	default:
-		return nil
-	}
-}
-
-func (c *Crawler) scrapeContent(ctx context.Context, t types.Links, docType string) ([]types.Links, string, error) {
-	id := c.extractIDFromURL(t.Link)
+func (c *Crawler) scrapeContent(ctx context.Context, t types.Links, docType, canonical, cleanURL string) ([]types.Links, string, error) {
+	id := extractID(canonical)
 	if id == "" {
-		return nil, "", fmt.Errorf("could not extract %s ID from %s", docType, t.Link)
+		return nil, "", fmt.Errorf("could not extract %s ID from canonical %s", docType, canonical)
 	}
 
-	var title string
-	var content []byte
-	var filename string
-	var exportURL string
-	var links []types.Links
-
-	switch docType {
-	case "doc":
-		exportURL = fmt.Sprintf("https://docs.google.com/document/d/%s/export?format=html", id)
-		filename = "content.html"
-	case "sheet":
-		exportURL = fmt.Sprintf("https://docs.google.com/spreadsheets/d/%s/export?format=csv", id)
-		filename = "content.csv"
-	default:
+	config, exists := docConfigs[docType]
+	if !exists {
 		return nil, "", fmt.Errorf("unsupported document type: %s", docType)
 	}
 
-	// Fetch content
+	// Build export URL and fetch content
+	exportURL := fmt.Sprintf(config.exportURLTemplate, id)
 	resp, err := c.httpGet(ctx, exportURL)
 	if err != nil {
 		return nil, "", err
 	}
 	defer resp.Body.Close()
 
-	content, err = io.ReadAll(resp.Body)
+	content, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, "", fmt.Errorf("reading content: %w", err)
 	}
 
-	// Extract title based on type
-	switch docType {
-	case "doc":
-		root, err := html.Parse(bytes.NewReader(content))
-		if err != nil {
-			return nil, "", fmt.Errorf("parsing HTML: %w", err)
+	// Extract title and links (if applicable)
+	title, links, err := c.extractTitleAndLinks(content, docType, cleanURL, t.Depth, config.canExtractLinks)
+	if err != nil {
+		return nil, "", err
+	}
+
+	// Fallback for sheets: try fetching title from preview page
+	if title == "" && docType == "sheet" {
+		if fallbackTitle, err := c.fetchSheetTitle(ctx, id); err == nil {
+			title = fallbackTitle
 		}
-		title = c.extractHTMLTitle(root)
-		if title == "" {
-			title = c.firstHrefText(root)
-		}
-		if title == "" {
+	}
+
+	// Set default title if still empty
+	if title == "" {
+		if docType == "doc" {
 			title = "Untitled"
-		}
-		// Extract links for further crawling
-		links = c.extractLinks(root, types.Links{Link: t.Link, Depth: t.Depth + 1, Parent: ""})
-	case "sheet":
-		// TODO Do i need to do it this way? why can't I fetch the title the same way as fetching a Google Doc
-		title, err = c.fetchSheetTitle(ctx, id)
-		if err != nil {
-			slog.Warn("failed to get sheet title",
-				slog.String("id", id),
-				slog.Any("error", err))
+		} else {
 			title = "Untitled Sheet"
 		}
 	}
@@ -302,7 +297,7 @@ func (c *Crawler) scrapeContent(ctx context.Context, t types.Links, docType stri
 		return nil, "", fmt.Errorf("creating directory: %w", err)
 	}
 
-	if err := os.WriteFile(filepath.Join(dir, filename), content, 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, config.filename), content, 0o644); err != nil {
 		return nil, "", fmt.Errorf("writing content: %w", err)
 	}
 
@@ -335,7 +330,8 @@ func (c *Crawler) extractLinks(root *html.Node, parentTask types.Links) []types.
 		if n.Type == html.ElementNode && n.Data == "a" {
 			for _, attr := range n.Attr {
 				if attr.Key == "href" {
-					canonical, cleanURL := canonicalizeURL(c.resolve(parentTask.Link, attr.Val))
+					resolvedURL := c.resolve(parentTask.Link, attr.Val)
+					canonical, cleanURL := canonicalizeURL(resolvedURL)
 					if canonical != "" {
 						links = append(links, types.Links{
 							Link:   cleanURL,
@@ -353,11 +349,6 @@ func (c *Crawler) extractLinks(root *html.Node, parentTask types.Links) []types.
 
 	dfs(root)
 	return links
-}
-
-func (c *Crawler) extractIDFromURL(url string) string {
-	canonical, _ := canonicalizeURL(url)
-	return extractID(canonical)
 }
 
 func (c *Crawler) writeMetadata(dir string, m types.Metadata) {
@@ -435,7 +426,7 @@ func (c *Crawler) extractHTMLTitle(root *html.Node) string {
 		}
 	}
 	dfs(root)
-	title = c.titleTrimRE.ReplaceAllString(title, "")
+	title = titleTrimRE.ReplaceAllString(title, "")
 	return strings.TrimSpace(title)
 }
 
@@ -475,8 +466,8 @@ func (c *Crawler) nodeText(n *html.Node) string {
 
 func (c *Crawler) makeSlug(title, id string) string {
 	s := strings.ToLower(title)
-	s = c.nonAlphaNum.ReplaceAllString(s, "-")
-	s = c.multiHyphen.ReplaceAllString(s, "-")
+	s = nonAlphaNum.ReplaceAllString(s, "-")
+	s = multiHyphen.ReplaceAllString(s, "-")
 	s = strings.Trim(s, "-")
 	if len(s) > 60 {
 		s = s[:60]
@@ -490,21 +481,44 @@ func (c *Crawler) makeSlug(title, id string) string {
 
 func (c *Crawler) resolve(base, href string) string {
 	u, err := url.Parse(href)
-	if err != nil || u.IsAbs() {
-		_, cleanURL := canonicalizeURL(href)
-		return cleanURL
+	if err != nil {
+		return href
 	}
-	b, _ := url.Parse(base)
-	_, cleanURL := canonicalizeURL(b.ResolveReference(u).String())
-	return cleanURL
+
+	// If it's already absolute, return as-is
+	if u.IsAbs() {
+		return href
+	}
+
+	// Resolve relative URL
+	b, err := url.Parse(base)
+	if err != nil {
+		return href
+	}
+	return b.ResolveReference(u).String()
 }
 
-// RunCrawler provides backward compatibility with the old API
-func RunCrawler(startURL string, outDir string, out chan<- string) {
-	crawler := NewCrawler(DefaultConfig(), startURL, outDir)
-	ctx := context.Background()
-	if err := crawler.Run(ctx); err != nil {
-		slog.Error("crawler failed", slog.Any("error", err))
+func (c *Crawler) extractTitleAndLinks(content []byte, docType, cleanURL string, depth int, canExtractLinks bool) (string, []types.Links, error) {
+	var title string
+	var links []types.Links
+
+	// Only process HTML content for docs
+	if docType == "doc" {
+		root, err := html.Parse(bytes.NewReader(content))
+		if err != nil {
+			return "", nil, fmt.Errorf("parsing HTML: %w", err)
+		}
+
+		title = c.extractHTMLTitle(root)
+		if title == "" {
+			title = c.firstHrefText(root)
+		}
+
+		if canExtractLinks {
+			links = c.extractLinks(root, types.Links{Link: cleanURL, Depth: depth, Parent: ""})
+		}
 	}
-	close(out)
+
+	// For sheets and other types, return empty title (will use fallback)
+	return title, links, nil
 }

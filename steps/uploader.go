@@ -16,36 +16,28 @@ import (
 	"google.golang.org/api/option"
 )
 
-// UploaderConfig holds the uploader configuration
-type UploaderConfig struct {
-	ProjectID   string
-	DriveFolder string
-}
-
-// DefaultUploaderConfig returns a default uploader configuration
-func DefaultUploaderConfig() UploaderConfig {
-	return UploaderConfig{
-		DriveFolder: "Imported Docs",
-	}
+// UploadStats tracks upload statistics
+type UploadStats struct {
+	TotalUploaded int
+	Failed        int
+	Skipped       int
 }
 
 // Uploader handles uploading crawled files to Google Drive
 type Uploader struct {
 	driveService *drive.Service
-	config       UploaderConfig
-
-	// Step configuration
-	outDir string
-
+	projectID    string
+	driveFolder  string
+	outDir       string
 	// MIME type mappings for different file types
 	mimeTypes map[string]string
 }
 
 // NewUploader creates a new uploader with the given configuration
-func NewUploader(ctx context.Context, config UploaderConfig, outDir string) (*Uploader, error) {
+func NewUploader(ctx context.Context, projectID string, driveFolder string, outDir string) (*Uploader, error) {
 	opts := []option.ClientOption{}
-	if config.ProjectID != "" {
-		opts = append(opts, option.WithQuotaProject(config.ProjectID))
+	if projectID != "" {
+		opts = append(opts, option.WithQuotaProject(projectID))
 	}
 
 	drv, err := drive.NewService(ctx, opts...)
@@ -55,20 +47,14 @@ func NewUploader(ctx context.Context, config UploaderConfig, outDir string) (*Up
 
 	return &Uploader{
 		driveService: drv,
-		config:       config,
+		projectID:    projectID,
+		driveFolder:  driveFolder,
 		outDir:       outDir,
 		mimeTypes: map[string]string{
 			"doc":   "application/vnd.google-apps.document",
 			"sheet": "application/vnd.google-apps.spreadsheet",
 		},
 	}, nil
-}
-
-// UploadStats tracks upload statistics
-type UploadStats struct {
-	TotalUploaded int
-	Failed        int
-	Skipped       int
 }
 
 // Name implements the Step interface
@@ -78,9 +64,9 @@ func (u *Uploader) Name() string {
 
 // Run implements the Step interface and starts the upload process
 func (u *Uploader) Run(ctx context.Context) error {
-	parentID, err := u.ensureDriveFolder(ctx)
+	parentID, err := u.createDriveFolder(ctx)
 	if err != nil {
-		return fmt.Errorf("ensuring Drive folder: %w", err)
+		return fmt.Errorf("creating Drive folder: %w", err)
 	}
 
 	// Discover directories to process by scanning output directory
@@ -102,7 +88,7 @@ func (u *Uploader) Run(ctx context.Context) error {
 			return fmt.Errorf("loading metadata from %s: %w", dir, err)
 		}
 
-		if metadata.Type == "redirect" {
+		if metadata.IsRedirect {
 			stats.Skipped++
 			continue
 		}
@@ -204,15 +190,15 @@ func (u *Uploader) getContentFileName(fileType string) string {
 	return contentFiles[fileType]
 }
 
-// ensureDriveFolder ensures the Drive folder exists and returns its ID
-func (u *Uploader) ensureDriveFolder(ctx context.Context) (string, error) {
-	if u.config.DriveFolder == "" {
+// createDriveFolder creates a new Drive folder and returns its ID
+func (u *Uploader) createDriveFolder(ctx context.Context) (string, error) {
+	if u.driveFolder == "" {
 		return "", nil // No parent folder
 	}
 
 	// Search for existing folder
 	q := fmt.Sprintf("mimeType='application/vnd.google-apps.folder' and name='%s' and trashed=false",
-		u.config.DriveFolder)
+		u.driveFolder)
 
 	r, err := u.driveService.Files.List().Q(q).Fields("files(id)").Do()
 	if err != nil {
@@ -221,14 +207,14 @@ func (u *Uploader) ensureDriveFolder(ctx context.Context) (string, error) {
 
 	if len(r.Files) > 0 {
 		slog.Info("found existing drive folder",
-			slog.String("name", u.config.DriveFolder),
+			slog.String("name", u.driveFolder),
 			slog.String("id", r.Files[0].Id))
 		return r.Files[0].Id, nil
 	}
 
 	// Create new folder
 	f := &drive.File{
-		Name:     u.config.DriveFolder,
+		Name:     u.driveFolder,
 		MimeType: "application/vnd.google-apps.folder",
 	}
 
@@ -238,7 +224,7 @@ func (u *Uploader) ensureDriveFolder(ctx context.Context) (string, error) {
 	}
 
 	slog.Info("created drive folder",
-		slog.String("name", u.config.DriveFolder),
+		slog.String("name", u.driveFolder),
 		slog.String("id", created.Id))
 	return created.Id, nil
 }
