@@ -10,7 +10,13 @@ import (
 
 	"github.com/rasha-hantash/gdoc-pipeline/lib/logger"
 	"github.com/rasha-hantash/gdoc-pipeline/pipeline"
-	"github.com/rasha-hantash/gdoc-pipeline/steps"
+	"github.com/rasha-hantash/gdoc-pipeline/steps/crawler"
+	"github.com/rasha-hantash/gdoc-pipeline/steps/uploader"
+	"github.com/rasha-hantash/gdoc-pipeline/steps/patcher"
+
+	"google.golang.org/api/docs/v1"
+	"google.golang.org/api/option"
+	"google.golang.org/api/sheets/v4"
 )
 
 // -----------------------------------------------------------------------------
@@ -52,15 +58,33 @@ func main() {
 		slog.String("output_dir", out),
 		slog.Int("max_depth", depth))
 
-	// instantiate the crawler, uploader, and patcher
-	crawler := steps.NewCrawler(depth, 15*time.Second, url, out)
+		// --- build shared Google API clients ------------------------------------
+		var opts []option.ClientOption
+		if projectID != "" {
+			opts = append(opts, option.WithQuotaProject(projectID))
+		}
 	
-	uploader, err := steps.NewUploader(ctx, projectID, driveFolder, out)
+		docsSvc, err := docs.NewService(ctx, opts...)
+		if err != nil {
+			slog.Error("failed to create Docs service", slog.Any("error", err))
+			return
+		}
+	
+		sheetsSvc, err := sheets.NewService(ctx, opts...)
+		if err != nil {
+			slog.Error("failed to create Sheets service", slog.Any("error", err))
+			return
+		}	
+
+	// instantiate the crawler, uploader, and patcher
+	crawler := crawler.NewCrawler(depth, 15*time.Second, url, out, docsSvc, sheetsSvc)
+	
+	uploader, err := uploader.NewUploader(ctx, projectID, driveFolder, out)
 	if err != nil {
 		slog.Error("failed to create uploader", slog.Any("error", err))
 		os.Exit(1)
 	}
-	patcher, err := steps.NewPatcher(ctx, projectID, 1100*time.Millisecond, 6, out)
+	patcher, err := patcher.NewPatcher(ctx, projectID, 1100*time.Millisecond, 6, out)
 	if err != nil {
 		slog.Error("failed to create patcher", slog.Any("error", err))
 		os.Exit(1)
