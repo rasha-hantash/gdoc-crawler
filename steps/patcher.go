@@ -20,25 +20,11 @@ import (
 	"google.golang.org/api/option"
 )
 
-// PatcherConfig holds the patcher configuration
-type PatcherConfig struct {
-	ProjectID        string
-	RateLimitDelay   time.Duration // Delay between API calls to stay under rate limits
-	MaxRetryAttempts int           // Maximum retry attempts for failed requests
-}
-
-// DefaultPatcherConfig returns a default patcher configuration
-func DefaultPatcherConfig() PatcherConfig {
-	return PatcherConfig{
-		RateLimitDelay:   1100 * time.Millisecond, // Stay ≤ 60 req/min
-		MaxRetryAttempts: 6,
-	}
-}
-
 // Patcher handles patching hyperlinks in uploaded Google Docs
 type Patcher struct {
-	docsService *docs.Service
-	config      PatcherConfig
+	docsService      *docs.Service
+	rateLimitDelay   time.Duration
+	maxRetryAttempts int
 
 	// Step configuration
 	outDir string
@@ -48,10 +34,10 @@ type Patcher struct {
 }
 
 // NewPatcher creates a new patcher with the given configuration
-func NewPatcher(ctx context.Context, config PatcherConfig, outDir string) (*Patcher, error) {
+func NewPatcher(ctx context.Context, projectID string, rateLimitDelay time.Duration, maxRetryAttempts int, outDir string) (*Patcher, error) {
 	opts := []option.ClientOption{}
-	if config.ProjectID != "" {
-		opts = append(opts, option.WithQuotaProject(config.ProjectID))
+	if projectID != "" {
+		opts = append(opts, option.WithQuotaProject(projectID))
 	}
 
 	dsvc, err := docs.NewService(ctx, opts...)
@@ -60,10 +46,11 @@ func NewPatcher(ctx context.Context, config PatcherConfig, outDir string) (*Patc
 	}
 
 	return &Patcher{
-		docsService: dsvc,
-		config:      config,
-		outDir:      outDir,
-		linkRe:      regexp.MustCompile(`https://docs\.google\.com/(document|spreadsheets)/d/([^/?#]+)`),
+		docsService:      dsvc,
+		rateLimitDelay:   rateLimitDelay,
+		maxRetryAttempts: maxRetryAttempts,
+		outDir:           outDir,
+		linkRe:           regexp.MustCompile(`https://docs\.google\.com/(document|spreadsheets)/d/([^/?#]+)`),
 	}, nil
 }
 
@@ -151,6 +138,11 @@ func (p *Patcher) processDocument(ctx context.Context, metaPath string, idMap ma
 		return fmt.Errorf("loading metadata: %w", err)
 	}
 
+	if metadata.IsRedirect {
+		stats.DocsSkipped++
+		return nil // Skip redirects
+	}
+
 	if metadata.Type != "doc" {
 		stats.DocsSkipped++
 		return nil // Only patch documents, not sheets
@@ -188,7 +180,7 @@ func (p *Patcher) processDocument(ctx context.Context, metaPath string, idMap ma
 		slog.Int("links_patched", linksPatched))
 
 	// Rate limiting to stay under API limits
-	time.Sleep(p.config.RateLimitDelay)
+	time.Sleep(p.rateLimitDelay)
 
 	return nil
 }
@@ -314,7 +306,7 @@ func (p *Patcher) buildPatchRequests(doc *docs.Document, urlMap map[string]strin
 func (p *Patcher) executeWithRetry(ctx context.Context, fn func() error) error {
 	const base = time.Second
 
-	for i := 0; i < p.config.MaxRetryAttempts; i++ {
+	for i := 0; i < p.maxRetryAttempts; i++ {
 		err := fn()
 		if err == nil {
 			return nil
@@ -332,10 +324,10 @@ func (p *Patcher) executeWithRetry(ctx context.Context, fn func() error) error {
 
 		slog.Info("retrying after 503 error",
 			slog.Int("attempt", i+1),
-			slog.Int("max_attempts", p.config.MaxRetryAttempts))
+			slog.Int("max_attempts", p.maxRetryAttempts))
 	}
 
-	return fmt.Errorf("failed after %d attempts with 503 errors", p.config.MaxRetryAttempts)
+	return fmt.Errorf("failed after %d attempts with 503 errors", p.maxRetryAttempts)
 }
 
 // stripQuery removes query parameters and fragments from URLs

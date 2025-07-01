@@ -9,6 +9,7 @@ type Metadata struct {
 	Depth      int       `json:"depth"`
 	Type       string    `json:"type"`
 	CrawledAt  time.Time `json:"crawled_at"`
+	IsRedirect bool      `json:"is_redirect,omitempty"`
 	RedirectTo string    `json:"redirect_to,omitempty"`
 }
 
