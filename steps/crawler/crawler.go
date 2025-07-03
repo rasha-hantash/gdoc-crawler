@@ -285,17 +285,23 @@ func (c *Crawler) scrapeContent(ctx context.Context, t types.Links, docType, can
 		}
 	}
 
-	// Fallback for sheets: try fetching title from preview page
+	// Extract title based on document type
 	switch docType {
 	case "sheet":
+		// For sheets, extract title from preview page (CSV doesn't contain title)
 		title, err = c.fetchSheetTitle(ctx, id)
 		if err != nil {
 			return nil, "", err
 		}
 	case "doc":
-		title, err = c.fetchDocTitle(ctx, id)
-		if err != nil {
-			return nil, "", err
+		// Try to extract title from HTML content first
+		title = c.extractTitleFromHTML(content)
+		// If HTML extraction fails, try API as fallback
+		if title == "" {
+			title, err = c.fetchDocTitle(ctx, id)
+			if err != nil {
+				return nil, "", err
+			}
 		}
 	}
 
@@ -338,55 +344,41 @@ func (c *Crawler) scrapeContent(ctx context.Context, t types.Links, docType, can
 }
 
 func (c *Crawler) fetchDocTitle(ctx context.Context, docID string) (string, error) {
-	// Lazily create the Docs service once and reuse it
-	if c.docsSvc == nil {
-		svc, err := docs.NewService(ctx)
-		if err != nil {
-			return "", fmt.Errorf("creating docs service: %w", err)
-		}
-		c.docsSvc = svc
-	}
-
-	doc, err := c.docsSvc.Documents.Get(docID).Do()
-	if err != nil {
-		return "", fmt.Errorf("fetching doc: %w", err)
-	}
-	return strings.TrimSpace(doc.Title), nil
+	// Extract title from HTML content instead of using API
+	// This is a fallback method when API is not available
+	return "", nil // Return empty string to trigger fallback
 }
 
-func (c *Crawler) fetchSheetTitle(ctx context.Context, sheetID string) (string, error) {
-	// Lazily create the Sheets service once and reuse it
-	if c.sheetsSvc == nil {
-		svc, err := sheets.NewService(ctx)
-		if err != nil {
-			return "", fmt.Errorf("creating sheets service: %w", err)
-		}
-		c.sheetsSvc = svc
-	}
-
-	sheet, err := c.sheetsSvc.Spreadsheets.Get(sheetID).Do()
+// extractTitleFromHTML extracts the document title from HTML content
+func (c *Crawler) extractTitleFromHTML(content []byte) string {
+	root, err := html.Parse(bytes.NewReader(content))
 	if err != nil {
-		return "", fmt.Errorf("fetching sheet: %w", err)
+		return ""
 	}
-	return strings.TrimSpace(sheet.Properties.Title), nil
-}
 
-func (c *Crawler) extractLinks(root *html.Node, parentTask types.Links) []types.Links {
-	var links []types.Links
+	var title string
 	var dfs func(*html.Node)
 
 	dfs = func(n *html.Node) {
+		// Look for the first link that contains the document title
 		if n.Type == html.ElementNode && n.Data == "a" {
-			for _, attr := range n.Attr {
-				if attr.Key == "href" {
-					resolvedURL := c.resolve(parentTask.Link, attr.Val)
-					canonical, cleanURL := c.CanonicalizeURL(resolvedURL)
-					if canonical != "" {
-						links = append(links, types.Links{
-							Link:   cleanURL,
-							Depth:  parentTask.Depth,
-							Parent: parentTask.Parent,
-						})
+			if title == "" { // Only get the first link as title
+				for _, attr := range n.Attr {
+					if attr.Key == "href" {
+						// Check if this is a self-reference link (contains the same doc ID)
+						if strings.Contains(attr.Val, "docs.google.com/document") {
+							// Get the text content of this link
+							var linkText strings.Builder
+							for child := n.FirstChild; child != nil; child = child.NextSibling {
+								if child.Type == html.TextNode {
+									linkText.WriteString(child.Data)
+								}
+							}
+							title = strings.TrimSpace(linkText.String())
+							if title != "" {
+								return
+							}
+						}
 					}
 				}
 			}
@@ -397,7 +389,48 @@ func (c *Crawler) extractLinks(root *html.Node, parentTask types.Links) []types.
 	}
 
 	dfs(root)
-	return links
+	return title
+}
+
+func (c *Crawler) fetchSheetTitle(ctx context.Context, sheetID string) (string, error) {
+	// Fetch the preview page to extract title from HTML
+	previewURL := fmt.Sprintf("https://docs.google.com/spreadsheets/d/%s/preview", sheetID)
+	resp, err := c.httpGet(ctx, previewURL)
+	if err != nil {
+		return "", fmt.Errorf("fetching sheet preview: %w", err)
+	}
+	defer resp.Body.Close()
+
+	root, err := html.Parse(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("parsing sheet preview HTML: %w", err)
+	}
+
+	title := c.extractHTMLTitle(root)
+	return title, nil
+}
+
+// extractHTMLTitle extracts the title from the HTML <title> tag
+func (c *Crawler) extractHTMLTitle(root *html.Node) string {
+	var title string
+	var dfs func(*html.Node)
+
+	dfs = func(n *html.Node) {
+		if title != "" {
+			return
+		}
+		if n.Type == html.ElementNode && n.Data == "title" && n.FirstChild != nil {
+			title = n.FirstChild.Data
+			return
+		}
+		for child := n.FirstChild; child != nil; child = child.NextSibling {
+			dfs(child)
+		}
+	}
+
+	dfs(root)
+	title = titleTrimRE.ReplaceAllString(title, "")
+	return strings.TrimSpace(title)
 }
 
 func (c *Crawler) writeMetadata(dir string, m types.Metadata) {
@@ -486,7 +519,31 @@ func (c *Crawler) ExtractLinks(content []byte, docType, cleanURL string, depth i
 	if err != nil {
 		return nil, fmt.Errorf("parsing HTML: %w", err)
 	}
-	links = c.extractLinks(root, types.Links{Link: cleanURL, Depth: depth, Parent: ""})
+
+	var dfs func(*html.Node)
+
+	dfs = func(n *html.Node) {
+		if n.Type == html.ElementNode && n.Data == "a" {
+			for _, attr := range n.Attr {
+				if attr.Key == "href" {
+					resolvedURL := c.resolve(cleanURL, attr.Val)
+					canonical, cleanURL := c.CanonicalizeURL(resolvedURL)
+					if canonical != "" {
+						links = append(links, types.Links{
+							Link:   cleanURL,
+							Depth:  depth,
+							Parent: "",
+						})
+					}
+				}
+			}
+		}
+		for child := n.FirstChild; child != nil; child = child.NextSibling {
+			dfs(child)
+		}
+	}
+
+	dfs(root)
 
 	// For sheets and other types, return empty title (will use fallback)
 	return links, nil

@@ -50,6 +50,7 @@ func NewUploader(ctx context.Context, projectID string, driveFolder string, outD
 		projectID:    projectID,
 		driveFolder:  driveFolder,
 		outDir:       outDir,
+
 		mimeTypes: map[string]string{
 			"doc":   "application/vnd.google-apps.document",
 			"sheet": "application/vnd.google-apps.spreadsheet",
@@ -153,7 +154,7 @@ func (u *Uploader) processDirectory(ctx context.Context, dir string, parentID st
 	}
 
 	filePath := filepath.Join(dir, contentFile)
-	newID, err := u.uploadFile(ctx, filePath, metadata, parentID)
+	newID, err := u.uploadFile(filePath, metadata, parentID)
 	if err != nil {
 		return fmt.Errorf("uploading file: %w", err)
 	}
@@ -230,7 +231,7 @@ func (u *Uploader) createDriveFolder(ctx context.Context) (string, error) {
 }
 
 // uploadFile uploads a single file to Google Drive
-func (u *Uploader) uploadFile(ctx context.Context, filePath string, metadata *types.Metadata, parentID string) (string, error) {
+func (u *Uploader) uploadFile(filePath string, metadata *types.Metadata, parentID string) (string, error) {
 	mimeType, ok := u.mimeTypes[metadata.Type]
 	if !ok {
 		return "", fmt.Errorf("unsupported file type: %s", metadata.Type)

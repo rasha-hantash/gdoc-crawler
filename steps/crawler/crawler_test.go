@@ -19,25 +19,25 @@ func TestExtractTitleAndLinks(t *testing.T) {
 	}{
 		{
 			name:          "Basic doc with one link",
-			htmlPath:      "./../testdata/doc_with_link.html",
+			htmlPath:      "../../testdata/doc_with_link.html",
 			expectedTitle: "Sample Doc",
 			expectedLinks: 1,
 		},
 		{
 			name:          "No title fallback to link text",
-			htmlPath:      "./../testdata/doc_fallback_title.html",
+			htmlPath:      "../../testdata/doc_fallback_title.html",
 			expectedTitle: "Click here",
 			expectedLinks: 1,
 		},
 		{
 			name:          "No links",
-			htmlPath:      "./../testdata/doc_no_links.html",
+			htmlPath:      "../../testdata/doc_no_links.html",
 			expectedTitle: "Empty Doc",
 			expectedLinks: 0,
 		},
 		{
 			name:          "Malformed HTML",
-			htmlPath:      "./../testdata/malformed.html",
+			htmlPath:      "../../testdata/malformed.html",
 			expectedTitle: "",
 			expectedLinks: 0,
 		},
