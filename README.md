@@ -6,8 +6,6 @@ A minimal Go pipeline that:
 2. Uploads local copies to your Google Drive.
 3. Rewrites internal links to point at the new copies.
 
-All in \~450 lines of well‑commented code.
-
 ---
 
 ## Prerequisites
@@ -17,9 +15,6 @@ All in \~450 lines of well‑commented code.
 * **Credentials** – *pick one*:
 
   * **Application Default Credentials (ADC)** — run `gcloud auth application-default login` once. The Google client libraries automatically read the resulting user‑credential file in `~/.config/gcloud/`. Great for local dev.
-  * **Desktop OAuth client** — in **Google Cloud Console → APIs & Services → Credentials** choose **Create credentials → OAuth client ID → Desktop app** and download the `client_secret_*.json`. Then export `GOOGLE_APPLICATION_CREDENTIALS=/path/to/client_secret_*.json`.
-  * **Service‑account JSON key** — headless/CI friendly. The files will live in **the service account’s own Drive**, so share a folder with the SA or migrate them later if you need them in your personal Drive. Point `GOOGLE_APPLICATION_CREDENTIALS` at the key file.
-
 ---
 
 ## Install
