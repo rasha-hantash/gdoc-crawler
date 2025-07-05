@@ -12,36 +12,25 @@ A minimal Go pipeline that:
 
 * **Go ≥ 1.24**
 * Google Cloud project with the **Drive** *and* **Docs** APIs enabled
-* **Credentials** – *pick one*:
+* **Credentials** –:
+## 0) Pick or create a Google Cloud project that has the Drive API enabled.
+a. **Pick or create** a Google Cloud project that has the **Google Drive API** enabled.  Quick guide&nbsp;▸ <https://developers.google.com/workspace/guides/create-project>
 
-  * **Application Default Credentials (ADC)** — run `gcloud auth application-default login` once. The Google client libraries automatically read the resulting user‑credential file in `~/.config/gcloud/`. Great for local dev.
-  * **Service Account (CLI, recommended for automation/CI):**
-    ```bash
-    # Set your project ID
-    export PROJECT_ID="your-gcp-project-id"
+b. Point **gcloud** at that project and enable the API:
 
-    # 1. Create a service account
-    gcloud iam service-accounts create gdoc-pipeline --display-name="Google Doc Pipeline Service Account" --project="$PROJECT_ID"
+   ```bash
+   gcloud config set project YOUR_PROJECT_ID
+   gcloud services enable drive.googleapis.com
+   ```
 
-    # 2. Grant required roles
-    gcloud projects add-iam-policy-binding "$PROJECT_ID" \
-      --member="serviceAccount:gdoc-pipeline@$PROJECT_ID.iam.gserviceaccount.com" \
-      --role="roles/serviceusage.serviceUsageConsumer"
-    gcloud projects add-iam-policy-binding "$PROJECT_ID" \
-      --member="serviceAccount:gdoc-pipeline@$PROJECT_ID.iam.gserviceaccount.com" \
-      --role="roles/editor"
 
-    # 3. Create and download a key
-    gcloud iam service-accounts keys create gdoc-pipeline-key.json \
-      --iam-account=gdoc-pipeline@$PROJECT_ID.iam.gserviceaccount.com \
-      --project="$PROJECT_ID"
+## 1) Create an OAuth “Desktop” client and download client_secret.json  (Credentials → Create credentials → OAuth client ID → Desktop app).
 
-    # 4. Enable required APIs
-    gcloud services enable drive.googleapis.com docs.googleapis.com --project="$PROJECT_ID"
+## 2) Login, *requesting the Drive scope*, and tell gcloud to use your client ID.
+gcloud auth application-default login \
+  --client-id-file=client_secret_XXXXXX.json \
+  --scopes=https://www.googleapis.com/auth/drive.file
 
-    # 5. Set the environment variable before running the pipeline
-    export GOOGLE_APPLICATION_CREDENTIALS="$(pwd)/gdoc-pipeline-key.json"
-    ```
 
 ---
 
@@ -57,11 +46,15 @@ cd gdoc-pipeline && go mod tidy
 ## Quick start
 
 ```bash
-# If using a service account, set the environment variable first:
-export GOOGLE_APPLICATION_CREDENTIALS="/path/to/gdoc-pipeline-key.json"
 
-go run main.go -url "<public‑doc‑url>" -project "<gcp‑project>"
+go run main.go -url "<public‑doc‑url>"
 ```
+
+## Retry a step 
+```bash 
+go run main.go -url "<public‑doc‑url>"  -retry "uploader"
+```
+
 
 ### Frequently‑used flags
 
